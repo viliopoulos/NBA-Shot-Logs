@@ -1,0 +1,127 @@
+import xlrd
+import numpy as np
+import pandas as pd
+import seaborn as sns
+%pylab inline
+
+df = pd.read_excel('shot_logs.xlsx')
+players=pd.read_excel('players.xlsx')
+
+df.head(1)
+players.head(1)
+
+Concatenated the first and last names of the players in <b> players </b> dataset, lowercased it, and removed punctuation marks to clean it for the merge.
+
+players['Name']=players.First_Name+ ' ' +players.Surname
+players['Name']=players['Name'].str.lower()
+players['Name']=players['Name'].str.replace('.','')
+
+Occasionally players are traded to another team during a season. When this happens, most likely they will keep the same positions. In rare instances, the players will have to change positions. In <b> players</b> dataset, only 4 players changed positions during the season. Most of them changed between PG and SG, which are the similar guard positions. This is insignificant so I will only keep the first instance of the players names. 
+
+players.groupby('Name')['Pos'].nunique().nlargest(5)
+players.loc[(players.Name=='austin rivers') | (players.Name=='brandon knight') | (players.Name=='goran dragic') | (players.Name=='quincy pondexter'),'Pos']
+
+players.drop_duplicates(subset='Name', keep='first',inplace=True)
+
+Merged <b> df </b> with <b> players </b> by the player's name. 
+
+df2=df.merge(players,left_on='player_name', right_on='Name', how='left')
+len(df2)
+
+Removed rows that are unnecessary for the analysis and those that are repeated information.
+df2.drop(['GAME_ID','MATCHUP','SHOT_NUMBER','SHOT_RESULT','CLOSEST_DEFENDER_PLAYER_ID','PTS','player_name','player_id','Birthdate','Collage','First_Name','Surname','BMI'], axis=1,inplace=True)
+
+Since GAME_CLOCK column is a date time string, converted it into integer in seconds. There are 12 minutes per quarter, or 720 seconds. The Excel data has it in hour and minute; should be minute and seconds.
+#need to convert game_clock to numeric seconds since it's being read as a string/date_time. excel has it as HH:MM
+def to_integer(dt_time):
+    return 60*dt_time.hour+ 1*dt_time.minute
+
+df2['GAME_CLOCK']=df2['GAME_CLOCK'].apply(to_integer)
+
+Added columns to differentiate rookies and foreigners based on years of experience (less than 1 year is a rookie) and those born outside of U.S. are considered foreigners. 
+
+Also added clutch factor column. Clutch factor are shots made last 2 minutes of the last quarter when the points between the teams are 5 points or less. 
+
+type(df2.Experience)
+#df2['rookie']=( (df2.Experience <= 1) | (df2.Experience=='R'))*1.0
+df2['clutchfactor']= ((df2.PERIOD == 4) & (df2.FINAL_MARGIN<=5) & (df2.GAME_CLOCK<=120))*1.0
+df2['clutch_made']= ((df2.PERIOD == 4) & (df2.FINAL_MARGIN<=5) & (df2.GAME_CLOCK<=120) &(df2.FGM==1))*1.0
+df2['foreigner']= (df2.Birth_Place!='us')*1.0
+
+After creating rookie and foreigner column, decided to drop these.
+df2.drop(['Experience', 'Birth_Place'],axis=1, inplace=True)
+
+SHOT_CLOCK is the only colummn with NAN. If there is no data for shot clock, it means it is the last possession of the game and game time has run out (game clock =0). Thus, shot clock should be 0.
+pd.isnull(df2).sum() > 0
+
+df2.replace(np.NAN,0,inplace=True)
+
+# <u> 4. Machine Learning: Clustering </u>
+
+After several attempts on using decision tree and regression, they did not result in any findings. Clustering worked in this case. Through clustering, I was able to detect two different groups and research further into the differences between them.
+
+cluster= pd.get_dummies(df2,columns=['Pos', 'PTS_TYPE'])
+clusters=cluster.drop(['Name', 'CLOSEST_DEFENDER', 'Team', 'clutch_made', 'Age', 'W or L', 'Weight','SHOT_DIST','LOCATION','PERIOD', 'DRIBBLES', 'foreigner'],axis=1)
+from sklearn.cluster import KMeans
+clu = KMeans(n_clusters=2, random_state=0)
+clu.fit(clusters)
+clusters['cluster'] = clu.labels_
+clusterz=clusters.groupby('cluster').mean()
+clusterz
+
+These are some of the difference after analyzing the above table: cluster 0 has less time in the game clock with sightly more touch time and PG. Because of this table, I started to analyze further if PG have some correlation with the amount of time they have the ball towards the end of the game.
+
+import sklearn as sk
+import sklearn.tree as tree
+from IPython.display import Image  
+import pydotplus
+X= clusters.drop(['cluster','clutchfactor','SHOT_CLOCK','GAME_CLOCK'], axis=1)
+Y=clusters.cluster
+
+from sklearn.model_selection import train_test_split
+X_train, X_test, y_train, y_test = train_test_split(X,Y,test_size=0.3,random_state=2)
+
+dt = tree.DecisionTreeClassifier(max_depth=2)
+dt.fit(X=X,y=Y)
+The below tree is not the best tree, but it does demonstrate that:
+<ol>
+<li> If touch time less than 10 seconds and if height is smaller than 195cm, most likely in cluster 0 (PG are usually shorter). </li>
+<li> If touch time less than 10 seconds but height is larger than 195cm, most likely in cluster 1 (slightly more chance of being C who are taller players).</li>
+<li> If touch time greater than 10 seconds, most likely in cluster 0.
+
+dt_feature_names = list(X.columns)
+dt_target_names = [str(s) for s in Y.unique()]
+tree.export_graphviz(dt, out_file='tree.dot', 
+    feature_names=dt_feature_names, class_names=dt_target_names,
+    filled=True)  
+graph = pydotplus.graph_from_dot_file('tree.dot')
+Image(graph.create_png())
+
+clusters.corr()
+
+Obvious finding: Center is positively correlated with height; these defenders are usually taller. Point guards are negatively correlated with height; they are usually smaller players with more speed.
+
+# <u> 5. Validity of the Finding </u>
+
+Below are table/charts to validate that PGs attempt more shots and have more touch time last 2 minutes of the game (keep in mind game clock is in seconds and 720 is beginning of quarter, 0 is end).
+
+cluster2=df2.copy()
+
+cluster2['gameclock']=pd.cut(cluster2.GAME_CLOCK,6) #breaking up the game clock into 6 buckets
+
+cluster2['shot']=1
+
+table = cluster2.groupby(by=['Pos','gameclock']).agg({'TOUCH_TIME':'mean', 'shot':'sum'})\
+    .rename({'TOUCH_TIME':'Average_Touch_Time','shot':'Total_Shot_Attempts'}, axis=1)
+
+table
+
+sns.factorplot(x='gameclock', y='TOUCH_TIME', hue='Pos',data=cluster2, kind='bar',aspect=3)
+To validate more field goal attempts for point guards last 2 minutes.
+sns.countplot(x='gameclock',hue='Pos',data=cluster2)
+
+To further validate that PGs have more touch time during last 2 minutes on 3 point shot attempts too!
+sns.factorplot(x='gameclock', y='TOUCH_TIME', col='PTS_TYPE', hue='Pos',data=cluster2, kind='point',aspect=2)
+
+
+
